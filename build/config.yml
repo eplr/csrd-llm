@@ -1,0 +1,24 @@
+model: model.npz
+
+train-sets:
+  - corpus.spm.en
+  - corpus.spm.fr
+vocabs:
+  - spm.model
+  - spm.model
+
+mini-batch: 64
+maxi-batch: 1000
+max-length: 100
+
+valid-freq: 5000
+save-freq: 5000
+disp-freq: 500
+learn-rate: 0.0003
+optimizer: adam
+clip-norm: 5
+
+valid-sets:
+  - valid.spm.en
+  - valid.spm.fr
+valid-metrics: ce-mean-words perplexity bleu
