@@ -1,0 +1,9 @@
+lxml>=4.9.1
+docutils<=0.17
+sphinx==2.4.4
+breathe==4.13.0
+exhale
+sphinx_rtd_theme
+myst-parser==0.14.0a3
+sphinx-mathjax-offline
+Jinja2<3.1
