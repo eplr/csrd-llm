@@ -1,0 +1,684 @@
+# Azure pipelines for Marian NMT
+#
+# The pipeline need to be added manually to the repository, for example:
+# 1. Go to Your repository > Pipelines, click "New pipeline"
+# 2. Choose "Azure Repos Git" and a repository
+# 3. Choose "Existing Azure Pipelines YAML file" and specify path to this file
+# 4. "More actions" > "Save"
+
+parameters:
+# Allow skipping the entire 'Build' stage
+- name: runBuilds
+  displayName: Run builds? Uncheck to run regression tests only.
+  type: boolean
+  default: true
+
+# The pipeline CI trigger is set on the branch master only and PR trigger on a
+# (non-draft) pull request to any branch
+trigger:
+  # This minimizes the number of parallel pipeline runs. When a pipeline is
+  # running, the CI waits until it is completed before starting another one.
+  batch: true
+  branches:
+    include:
+    - master
+  paths:
+    exclude:
+    - azure-regression-tests.yml
+    - contrib
+    - doc
+    - examples
+    - regression-tests
+    - scripts
+    - VERSION
+    - vs
+    - '**/*.md'
+    - '**/*.txt'
+
+pool:
+  name: Azure Pipelines
+
+variables:
+  - group: marian-regression-tests
+  - name: BOOST_ROOT_WINDOWS
+    value: "C:/hostedtoolcache/windows/Boost/1.72.0/x86_64"
+  - name: BOOST_URL
+    value: "https://sourceforge.net/projects/boost/files/boost-binaries/1.72.0/boost_1_72_0-msvc-14.2-64.exe"
+  - name: CUDA_PATH_WINDOWS
+    value: "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA"
+  - name: MKL_DIR
+    value: "$(Build.SourcesDirectory)/mkl"
+  - name: MKL_URL
+    value: "https://data.statmt.org/romang/marian-regression-tests/ci/mkl-2020.1-windows-static.zip"
+  - name: VCPKG_COMMIT
+    value: 2022.03.10
+  - name: VCPKG_DIR
+    value: "$(Build.SourcesDirectory)/vcpkg"
+  - name: VCPKG_PACKAGES
+    value: "protobuf"
+  # The Visual Studio installation directory can be found using:
+  #   pushd "C:\Program Files (x86)\Microsoft Visual Studio\Installer\"
+  #   for /f "delims=" %%x in ('.\vswhere.exe -latest -property InstallationPath') do set VSPATH=%%x
+  #   popd
+  - name: VS_PATH
+    value: "C:/Program Files (x86)/Microsoft Visual Studio/2019/Enterprise"
+
+stages:
+- stage: Builds
+  jobs:
+
+  ######################################################################
+  - job: BuildWindows
+    cancelTimeoutInMinutes: 1
+    condition: eq(${{ parameters.runBuilds }}, true)
+    displayName: Windows
+
+    strategy:
+      matrix:
+        # Windows CPU-only build
+        "CPU":
+          cuda: false
+          cuda_version: ""
+        # Windows CPU+GPU build
+        "CUDA 10.2":
+          cuda: true
+          cuda_version: 10.2
+
+    pool:
+      vmImage: windows-2019
+
+    steps:
+    - checkout: self
+      submodules: true
+
+    - pwsh: .\scripts\ci\install_cuda_windows.ps1 "$(cuda_version)"
+      displayName: Install CUDA
+      condition: eq(variables.cuda, true)
+
+    - pwsh: |
+        C:\msys64\usr\bin\wget.exe -nv $(MKL_URL) -O mkl.zip
+        Expand-Archive -Force mkl.zip $(MKL_DIR)
+      displayName: Download MKL
+
+    ## Cache for Boost
+    #- task: Cache@2
+    #  displayName: Cache Boost
+    #  inputs:
+    #    # Change the first value (v0) to another value to clear the cache
+    #    key: '"v0" | "boost" | "$(BOOST_URL)" | "$(BOOST_ROOT_WINDOWS)" | "$(Agent.OS)"'
+    #    path: $(BOOST_ROOT_WINDOWS)
+    #    cacheHitVar: CACHE_BOOST_RESTORED
+
+    # Boost is no longer pre-installed on Azure/GitHub-hosted Windows runners
+    - pwsh: |
+        Write-Host "Downloading Boost to $(BOOST_ROOT_WINDOWS)"
+        C:\msys64\usr\bin\wget.exe -nv "$(BOOST_URL)" -O "$(Pipeline.Workspace)/boost.exe"
+        Start-Process -Wait -FilePath "$(Pipeline.Workspace)/boost.exe" "/SILENT","/SP-","/SUPPRESSMSGBOXES","/DIR=$(BOOST_ROOT_WINDOWS)"
+      displayName: Download Boost
+      condition: ne(variables.CACHE_BOOST_RESTORED, 'true')
+
+    ## Cache for vcpkg packages. It does not work yet properly due to linker errors after restoring it.
+    #- task: Cache@2
+    #  displayName: Cache vcpkg
+    #  inputs:
+    #    # Change the first value (v0) to another value to clear the cache
+    #    key: '"v0" | "vcpkg" | "$(VCPKG_COMMIT)" | "$(VCPKG_PACKAGES)" | "$(Agent.OS)"'
+    #    path: $(VCPKG_DIR)
+    #    cacheHitVar: CACHE_VCPKG_RESTORED
+
+    - pwsh: |
+        git clone https://github.com/Microsoft/vcpkg.git $(VCPKG_DIR)
+        cd $(VCPKG_DIR)
+        git checkout $(VCPKG_COMMIT)
+        pushd
+        .\bootstrap-vcpkg.bat -disableMetrics
+        popd
+        # Install packages
+        .\vcpkg.exe install --triplet x64-windows-static $(VCPKG_PACKAGES)
+        # Clean to make the cache smaller
+        Remove-Item $(VCPKG_DIR)\downloads  -Force -Recurse -ErrorAction SilentlyContinue
+        Remove-Item $(VCPKG_DIR)\buildtrees -Force -Recurse -ErrorAction SilentlyContinue
+      displayName: Prepare vcpkg
+      condition: ne(variables.CACHE_VCPKG_RESTORED, 'true')
+
+    - script: |
+        :: Load VS environment
+        call "$(VS_PATH)/VC/Auxiliary/Build/vcvarsall.bat" x64
+        :: Create build directory
+        mkdir build
+        cd build
+        :: Run CMake
+        cmake .. -G Ninja ^
+          -DCMAKE_BUILD_TYPE="Debug" ^
+          -DCMAKE_C_COMPILER="cl.exe" ^
+          -DCMAKE_CXX_COMPILER="cl.exe" ^
+          -DCMAKE_MAKE_PROGRAM="ninja.exe" ^
+          -DCMAKE_TOOLCHAIN_FILE="$(VCPKG_DIR)\scripts\buildsystems\vcpkg.cmake" ^
+          -DVCPKG_TARGET_TRIPLET="x64-windows-static" ^
+          ^
+          -DBOOST_ROOT="$(BOOST_ROOT)" ^
+          -DBOOST_INCLUDEDIR="$(BOOST_ROOT)/include" ^
+          -DBOOST_LIBRARYDIR="$(BOOST_ROOT)/lib" ^
+          -DOPENSSL_USE_STATIC_LIBS="TRUE" ^
+          -DOPENSSL_MSVC_STATIC_RT="TRUE" ^
+          ^
+          -DCOMPILE_CPU="TRUE" ^
+          -DCOMPILE_CUDA="$(cuda)" ^
+          -DCOMPILE_EXAMPLES="FALSE" ^
+          -DCOMPILE_SERVER="TRUE" ^
+          -DCOMPILE_TESTS="TRUE" ^
+          ^
+          -DUSE_CUDNN="FALSE" ^
+          -DUSE_FBGEMM="TRUE" ^
+          -DUSE_MPI="FALSE" ^
+          -DUSE_NCCL="FALSE" ^
+          -DUSE_SENTENCEPIECE="TRUE" ^
+          -DUSE_STATIC_LIBS="TRUE"
+      displayName: Configure CMake
+      env:
+        # Set envvars so that CMake can find the installed packages
+        MKLROOT: $(MKL_DIR)
+        CUDA_PATH: $(CUDA_PATH_WINDOWS)/v$(cuda_version)
+        BOOST_ROOT: $(BOOST_ROOT_WINDOWS)
+
+    - script: |
+        call "$(VS_PATH)/VC/Auxiliary/Build/vcvarsall.bat" x64
+        ninja
+      displayName: Compile
+      workingDirectory: build
+
+    - script: |
+        call "$(VS_PATH)/VC/Auxiliary/Build/vcvarsall.bat" x64
+        ctest
+      displayName: Run unit tests
+      workingDirectory: build
+      condition: eq(variables.cuda, false)
+
+    # Note that versions from Marian executables will not be printed for CUDA builds
+    - script: |
+        .\marian.exe --version
+        .\marian-decoder.exe --version
+        .\marian-scorer.exe --version
+        .\marian-server.exe --version
+        .\spm_encode.exe --version
+      displayName: Print versions
+      workingDirectory: build
+
+  ######################################################################
+  - job: BuildUbuntu
+    cancelTimeoutInMinutes: 1
+    condition: eq(${{ parameters.runBuilds }}, true)
+    displayName: Ubuntu
+    timeoutInMinutes: 120
+
+    # Minimal tested configurations for marian-dev v1.11 and C++17:
+    # * Ubuntu 16.04, GCC 7.5, CMake 3.10.2, CUDA 9.2 (probably GCC 6 would work too)
+    # * Ubuntu 18.04, GCC 7.5, CMake 3.12.2, CUDA 10.0
+    strategy:
+      matrix:
+        ################################################################
+        # Ubuntu CPU-only build
+        "CPU-only":
+          image: ubuntu-20.04
+          boost: true
+          cpu: true
+          gpu: false
+          cuda: ""
+          gcc: 9
+          unit_tests: true
+          examples: false
+          static: true
+        # Ubuntu GPU-only build
+        "GPU-only":
+          image: ubuntu-20.04
+          boost: true
+          cpu: false
+          gpu: true
+          cuda: 11.1
+          gcc: 9
+          unit_tests: false
+          examples: false
+          static: false
+        ################################################################
+        # Ubuntu 22.04 supports CUDA 11+
+        #
+        # CPU is disabled because FBGEMM + GCC 9+ do not compile on machines with
+        # avx512_vnni, see https://github.com/marian-nmt/marian-dev/issues/709
+        "22.04 CUDA 11.7 gcc-11":
+          image: ubuntu-22.04
+          boost: false
+          cpu: false
+          gpu: true
+          cuda: 11.7
+          gcc: 11
+          unit_tests: false # disable unit tests to minimize compilation time
+          examples: false   # disable examples to minimize compilation time
+          static: false
+        ################################################################
+        # Ubuntu 20.04 supports CUDA 11+
+        "20.04 CUDA 11.1 gcc-9":
+          image: ubuntu-20.04
+          boost: true
+          cpu: true
+          gpu: true
+          cuda: 11.1
+          gcc: 9
+          unit_tests: true
+          examples: true
+          static: true
+        ################################################################
+        # Ubuntu 16.04 is no longer available on Azure-hosted machines
+
+    pool:
+      vmImage: $(image)
+
+    steps:
+    - checkout: self
+      submodules: true
+
+    # The following packages are already installed on Azure-hosted runners: build-essential openssl libssl-dev
+    # No need to install libprotobuf{17,10,9v5} on Ubuntu {20,18,16}.04 because it is installed together with libprotobuf-dev
+    # Note that installation of libunwind-dev is a bug fix for ubuntu-22.04 images on Azure/GitHub-hosted machines
+    # and is normally not required
+    - bash: sudo apt-get install -y libunwind-dev libgoogle-perftools-dev libprotobuf-dev protobuf-compiler
+      displayName: Install packages
+
+    # Boost is no longer pre-installed on Azure/GitHub-hosted runners
+    - bash: sudo apt-get install -y libboost-system-dev
+      displayName: Install Boost
+      condition: eq(variables.boost, true)
+
+    # https://software.intel.com/content/www/us/en/develop/articles/installing-intel-free-libs-and-python-apt-repo.html
+    - bash: |
+        wget -qO- "https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS-2019.PUB" | sudo apt-key add -
+        sudo sh -c "echo deb https://apt.repos.intel.com/mkl all main > /etc/apt/sources.list.d/intel-mkl.list"
+        sudo apt-get update -o Dir::Etc::sourcelist="/etc/apt/sources.list.d/intel-mkl.list"
+        sudo apt-get install -y --no-install-recommends intel-mkl-64bit-2020.0-088
+      displayName: Install MKL
+      condition: eq(variables.cpu, true)
+
+    # The script simplifies installation of different versions of CUDA
+    - bash: ./scripts/ci/install_cuda_ubuntu.sh $(cuda)
+      displayName: Install CUDA
+      condition: eq(variables.gpu, true)
+
+    - bash: |
+        mkdir -p build
+        cd build
+        CC=/usr/bin/gcc-$(gcc) CXX=/usr/bin/g++-$(gcc) CUDAHOSTCXX=/usr/bin/g++-$(gcc) \
+        cmake .. \
+          -DCOMPILE_CPU=$(cpu) \
+          -DCOMPILE_CUDA=$(gpu) \
+          -DCOMPILE_EXAMPLES=$(examples) \
+          -DCOMPILE_SERVER=$(boost) \
+          -DCOMPILE_TESTS=$(unit_tests) \
+          -DUSE_FBGEMM=$(cpu) \
+          -DUSE_SENTENCEPIECE=on \
+          -DUSE_STATIC_LIBS=$(static) \
+          -DBoost_ARCHITECTURE=-x64 \
+          -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-$(cuda)
+      displayName: Configure CMake
+
+    # Clean build/src/ to safe disk space on Azure-hosted VMs and stay below the 10GB limit
+    - bash: |
+        make -j3
+        rm -rf src/
+      displayName: Compile
+      workingDirectory: build
+
+    # Unit tests are run only for CPU-only builds because Azure-hosted runners do not have GPUs
+    # TODO: add an option to CMake to compile unit tests only for CPU
+    - bash: make test
+      displayName: Run unit tests
+      workingDirectory: build
+      condition: and(eq(variables.unit_tests, true), eq(variables.gpu, false))
+
+    - bash: |
+        ./marian --version
+        ./marian-decoder --version
+        ./marian-scorer --version
+        ./spm_encode --version
+      displayName: Print versions
+      workingDirectory: build
+
+  ######################################################################
+  - job: BuildMacOS
+    cancelTimeoutInMinutes: 1
+    condition: eq(${{ parameters.runBuilds }}, true)
+    displayName: macOS CPU clang
+
+    pool:
+      vmImage: macos-12
+
+    steps:
+    - checkout: self
+      submodules: true
+
+    - bash: brew install boost openblas openssl protobuf
+      displayName: Install packages
+
+    # Openblas location is exported explicitly because openblas is keg-only, which means it was not symlinked into /usr/local/.
+    # CMake cannot find BLAS on Azure runners if Marian is being compiled statically, hence USE_STATIC_LIBS=off
+    - bash: |
+        export LDFLAGS="-L/usr/local/opt/openblas/lib"
+        export CPPFLAGS="-I/usr/local/opt/openblas/include"
+        mkdir -p build
+        cd build
+        cmake .. \
+          -DCOMPILE_CPU=on \
+          -DCOMPILE_CUDA=off \
+          -DCOMPILE_EXAMPLES=on \
+          -DCOMPILE_SERVER=on \
+          -DCOMPILE_TESTS=on \
+          -DUSE_FBGEMM=on \
+          -DUSE_SENTENCEPIECE=on \
+          -DUSE_STATIC_LIBS=off
+      displayName: Configure CMake
+
+    - bash: make -j2
+      displayName: Compile
+      workingDirectory: build
+
+    - bash: make test
+      displayName: Run unit tests
+      workingDirectory: build
+
+    - bash: |
+        ./marian --version
+        ./marian-decoder --version
+        ./marian-scorer --version
+        ./spm_encode --version
+      displayName: Print versions
+      workingDirectory: build
+
+  ######################################################################
+  - job: BuildInstall
+    cancelTimeoutInMinutes: 1
+    condition: eq(${{ parameters.runBuilds }}, true)
+    displayName: Linux CPU library install
+
+    pool:
+      vmImage: ubuntu-20.04
+
+    steps:
+    - checkout: self
+      submodules: true
+
+    # The following packages are already installed on Azure-hosted runners: build-essential openssl libssl-dev
+    # No need to install libprotobuf{17,10,9v5} on Ubuntu {20,18,16}.04 because it is installed together with libprotobuf-dev
+    - bash: sudo apt-get install -y libgoogle-perftools-dev libprotobuf-dev protobuf-compiler
+      displayName: Install packages
+
+    # https://software.intel.com/content/www/us/en/develop/articles/installing-intel-free-libs-and-python-apt-repo.html
+    - bash: |
+        wget -qO- "https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS-2019.PUB" | sudo apt-key add -
+        sudo sh -c "echo deb https://apt.repos.intel.com/mkl all main > /etc/apt/sources.list.d/intel-mkl.list"
+        sudo apt-get update -o Dir::Etc::sourcelist="/etc/apt/sources.list.d/intel-mkl.list"
+        sudo apt-get install -y --no-install-recommends intel-mkl-64bit-2020.0-088
+      displayName: Install MKL
+
+    - bash: /usr/bin/gcc-9 --version
+      displayName: Print GCC version
+
+    - bash: |
+        mkdir -p install
+        mkdir -p build
+        cd build
+        CC=/usr/bin/gcc-9 CXX=/usr/bin/g++-9 \
+        cmake .. \
+          -DCMAKE_INSTALL_PREFIX=../install \
+          -DCMAKE_BUILD_TYPE=slim \
+          -DCOMPILE_LIBRARY_ONLY=on \
+          -DCOMPILE_CUDA=off \
+          -DGENERATE_MARIAN_INSTALL_TARGETS=on \
+          -DUSE_FBGEMM=on \
+          -DUSE_SENTENCEPIECE=on
+      displayName: Configure CMake
+
+    - bash: make -j3 install
+      displayName: Compile & install
+      workingDirectory: build
+
+    - bash: |
+        test -e lib/libmarian.a
+        test -e lib/libfbgemm.a
+        test -e lib/libsentencepiece.a
+        ls -lah *
+      displayName: Check targets
+      workingDirectory: install
+
+
+# Marian is built in the same job where the regression tests are run to make sure that executables
+# are compiled and run on a machine with the same CPU architecture, which is required for
+# compilations with FBGEMM.
+- stage: Tests
+  jobs:
+
+  ######################################################################
+  - job: TestWindows
+    cancelTimeoutInMinutes: 1
+    displayName: Windows CPU+FBGEMM
+
+    pool:
+      vmImage: windows-2019
+
+    steps:
+    # Due to multiple checkouts this will be commonly cloned into D:\a\1\s\marian-dev
+    - checkout: self
+      submodules: true
+
+    - pwsh: |
+        C:\msys64\usr\bin\wget.exe -nv $(MKL_URL) -O mkl.zip
+        Expand-Archive -Force mkl.zip $(MKL_DIR)
+      displayName: Download MKL
+
+    # Cache for vcpkg packages
+    - task: Cache@2
+      displayName: Cache vcpkg
+      inputs:
+        # Change the first value (v0) to another value to clear the cache
+        key: '"v0" | "vcpkg" | "$(VCPKG_COMMIT)" | "$(VCPKG_PACKAGES)" | "$(Agent.OS)"'
+        path: $(VCPKG_DIR)
+        cacheHitVar: CACHE_VCPKG_RESTORED
+
+    - pwsh: |
+        git clone https://github.com/Microsoft/vcpkg.git $(VCPKG_DIR)
+        cd $(VCPKG_DIR)
+        git checkout $(VCPKG_COMMIT)
+        pushd
+        .\bootstrap-vcpkg.bat -disableMetrics
+        popd
+        # Install packages
+        .\vcpkg.exe install --triplet x64-windows-static $(VCPKG_PACKAGES)
+        # Clean to make the cache smaller
+        Remove-Item $(VCPKG_DIR)\downloads  -Force -Recurse -ErrorAction SilentlyContinue
+        Remove-Item $(VCPKG_DIR)\buildtrees -Force -Recurse -ErrorAction SilentlyContinue
+      displayName: Prepare vcpkg
+      condition: ne(variables.CACHE_VCPKG_RESTORED, 'true')
+
+    - script: |
+        :: Load VS environment
+        call "$(VS_PATH)/VC/Auxiliary/Build/vcvarsall.bat" x64
+        :: Create build directory
+        mkdir build
+        cd build
+        :: Run CMake
+        cmake .. -G Ninja ^
+          -DCMAKE_BUILD_TYPE="Slim" ^
+          -DCMAKE_C_COMPILER="cl.exe" ^
+          -DCMAKE_CXX_COMPILER="cl.exe" ^
+          -DCMAKE_MAKE_PROGRAM="ninja.exe" ^
+          -DCMAKE_TOOLCHAIN_FILE="$(VCPKG_DIR)\scripts\buildsystems\vcpkg.cmake" ^
+          -DVCPKG_TARGET_TRIPLET="x64-windows-static" ^
+          -DDETERMINISTIC="TRUE" ^
+          ^
+          -DCOMPILE_CPU="TRUE" ^
+          -DCOMPILE_CUDA="FALSE" ^
+          ^
+          -DUSE_FBGEMM="TRUE" ^
+          -DUSE_SENTENCEPIECE="TRUE" ^
+          -DUSE_STATIC_LIBS="TRUE"
+      displayName: Configure CMake
+      env:
+        # Set envvars so that CMake can find the installed packages
+        MKLROOT: $(MKL_DIR)
+      workingDirectory: marian-dev
+
+    - script: |
+        pwd
+        call "$(VS_PATH)/VC/Auxiliary/Build/vcvarsall.bat" x64
+        ninja
+      displayName: Compile
+      workingDirectory: marian-dev/build
+
+    ## Publish an artifact with Marian executables. Disabled because it is not portable due to
+    ## fbgemm and not needed at the moment
+    #- pwsh: Compress-Archive -Path marian*.exe spm_*.exe -DestinationPath $(Build.SourcesDirectory)/marian-dev-ci_windows-x64_cpu.zip
+      #displayName: Prepare binaries
+      #workingDirectory: marian-dev/build
+    #- publish: marian-dev-ci_windows-x64_cpu.zip
+      #artifact: marian-dev-ci_windows-x64_cpu
+      #displayName: Publish binaries
+
+    # Running regression tests
+    # Due to multiple checkouts this will be commonly cloned into D:\a\1\s\marian-prod-tests
+    - checkout: git://Marian/marian-prod-tests
+
+    # Collect details about the CPU architecture, etc.
+    # Because the outputs goes to *.log files, they will be also included in the artifact with test outputs.
+    - script: bash -c "cat /proc/cpuinfo | tee cpuinfo.log"
+      displayName: Machine statistics
+      workingDirectory: marian-prod-tests
+
+    # The current SAS token will expire on 12/31/2023 and a new one will need to be set in Marian > Pipelines > Library
+    - bash: |
+        cd models
+        bash download-models.sh
+        ls
+      displayName: Prepare tests
+      env:
+        AZURE_STORAGE_SAS_TOKEN: $(marian-prod-tests-blob-sas-token)
+      workingDirectory: marian-prod-tests
+
+    # Avoid using $(Build.SourcesDirectory) in bash tasks because on Windows pools it uses '\'
+    # instead of '/', which often breaks the job
+    - bash: MARIAN=../marian-dev/build TIMEOUT=10m bash ./run_mrt.sh '#cpu' '#basics' '#devops'
+      continueOnError: true
+      displayName: Run tests
+      workingDirectory: marian-prod-tests
+
+    - bash: |
+        # cut -c3- removes './' from paths making 7z to retain the directory structure
+        find . -type f \( -name "*.log" -o -name "*.out" -o -name "*.diff" \) -print | cut -c3- > listing.txt
+        echo "Creating an artifact with the following files:"
+        cat listing.txt
+        7z a -tzip ../regression-tests-ci_windows-x64_cpu.zip @listing.txt
+      displayName: Collect outputs
+      workingDirectory: marian-prod-tests
+
+    - publish: regression-tests-ci_windows-x64_cpu.zip
+      artifact: regression-tests-ci_windows-x64_cpu
+      displayName: Publish outputs
+
+  ######################################################################
+  - job: TestLinux
+    cancelTimeoutInMinutes: 1
+    displayName: Linux CPU+FBGEMM
+
+    pool:
+      vmImage: ubuntu-latest
+
+    steps:
+    # Due to multiple checkouts this will be commonly cloned into D:\a\1\s\marian-dev
+    - checkout: self
+      submodules: true
+
+    # The following packages are already installed on Azure-hosted runners: build-essential openssl libssl-dev
+    # No need to install libprotobuf{17,10,9v5} on Ubuntu {20,18,16}.04 because it is installed together with libprotobuf-dev
+    # Installing libunwind-dev fixes a bug in 2204 (the libunwind-14 and libunwind-dev conflict)
+    - bash: |
+        sudo apt-get install -y libunwind-dev
+        sudo apt-get install -y libgoogle-perftools-dev libprotobuf-dev protobuf-compiler gcc-9 g++-9
+      displayName: Install packages
+
+    # https://software.intel.com/content/www/us/en/develop/articles/installing-intel-free-libs-and-python-apt-repo.html
+    - bash: |
+        wget -qO- "https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS-2019.PUB" | sudo apt-key add -
+        sudo sh -c "echo deb https://apt.repos.intel.com/mkl all main > /etc/apt/sources.list.d/intel-mkl.list"
+        sudo apt-get update -o Dir::Etc::sourcelist="/etc/apt/sources.list.d/intel-mkl.list"
+        sudo apt-get install -y --no-install-recommends intel-mkl-64bit-2020.0-088
+      displayName: Install MKL
+
+    # Note that COMPILE_CPU=on and USE_SENTENCEPUECE=on are set explicitly to make them detectable
+    # by the regression tests framework (not sure if it is still required)
+    - bash: |
+        mkdir -p install
+        mkdir -p build
+        cd build
+        CC=/usr/bin/gcc-9 CXX=/usr/bin/g++-9 \
+        cmake .. \
+          -DCMAKE_BUILD_TYPE=slim \
+          -DCOMPILE_CPU=on \
+          -DCOMPILE_CUDA=off \
+          -DDETERMINISTIC=on \
+          -DUSE_FBGEMM=on \
+          -DUSE_SENTENCEPIECE=on \
+          -DUSE_STATIC_LIBS=on
+      displayName: Configure CMake
+      workingDirectory: marian-dev
+
+    - bash: make -j3
+      displayName: Compile
+      workingDirectory: marian-dev/build
+
+    ## Publish an artifact with Marian executables. Disabled because it is not portable due to
+    ## fbgemm and not needed at the moment
+    #- bash: zip $(Build.SourcesDirectory)/marian-dev-ci_linux-x64-static_cpu.zip marian* spm_*
+      #displayName: Prepare binaries
+      #workingDirectory: marian-dev/build
+    #- publish: marian-dev-ci_linux-x64-static_cpu.zip
+      #artifact: marian-dev-ci_linux-x64-static_cpu
+      #displayName: Publish binaries
+
+    # Running regression tests
+    # Due to multiple checkouts this will be commonly cloned into D:\a\1\s\marian-prod-tests
+    - checkout: git://Marian/marian-prod-tests
+
+    # Collect details about the CPU architecture, etc.
+    # Because the outputs goes to *.log files, they will be also included in the artifact with test outputs.
+    - bash: |
+        echo ">>> lscpu"
+        lscpu | tee lscpu.log
+        echo ">>> cpuinfo"
+        cat /proc/cpuinfo | tee cpuinfo.log
+        /usr/bin/gcc-9 --version | tee gcc.log
+      displayName: Machine statistics
+      workingDirectory: marian-prod-tests
+
+    # The current SAS token will expire on 12/31/2023 and a new one will need to be set in Marian > Pipelines > Library
+    - bash: |
+        cd models
+        bash download-models.sh
+        ls
+      displayName: Prepare tests
+      env:
+        AZURE_STORAGE_SAS_TOKEN: $(marian-prod-tests-blob-sas-token)
+      workingDirectory: marian-prod-tests
+
+    - bash: MARIAN=../marian-dev/build bash ./run_mrt.sh '#cpu' '#basics' '#devops'
+      continueOnError: true
+      displayName: Run tests
+      workingDirectory: marian-prod-tests
+
+    - bash: |
+        # cut -c3- removes './' from paths making 7z to retain the directory structure
+        find . -type f \( -name "*.log" -o -name "*.out" -o -name "*.diff" \) -print | cut -c3- > listing.txt
+        echo "Creating an artifact with the following files:"
+        cat listing.txt
+        7z a -tzip ../regression-tests-ci_linux-x64-static_cpu.zip @listing.txt
+      displayName: Collect outputs
+      workingDirectory: marian-prod-tests
+
+    - publish: regression-tests-ci_linux-x64-static_cpu.zip
+      artifact: regression-tests-ci_linux-x64-static_cpu
+      displayName: Publish outputs
